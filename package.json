@@ -2,9 +2,11 @@
   "name": "scanning-logistics",
   "version": "1.0.0",
   "private": true,
-  "description": "Warehouse parcel scanner — Vercel monorepo (frontend + serverless backend).",
+  "description": "Warehouse parcel scanner — Express backend + Vite frontend, deployed as a single Node service.",
   "type": "module",
   "scripts": {
+    "build": "npm install --prefix frontend && npm run build --prefix frontend",
+    "start": "node backend/src/server.js",
     "vercel-build": "npm install --prefix frontend && npm run build --prefix frontend"
   },
   "dependencies": {
