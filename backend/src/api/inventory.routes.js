@@ -10,61 +10,48 @@ import { requireAuth, requireRole } from '../middleware/auth.middleware.js';
 
 const router = Router();
 
-/** GET /api/inventory/products — list everything in the catalogue */
-router.get('/products', requireAuth, (req, res, next) => {
+router.get('/products', requireAuth, async (req, res, next) => {
   try {
-    res.json({ products: inventory.listProducts() });
+    res.json({ products: await inventory.listProducts() });
   } catch (err) { next(err); }
 });
 
-/** POST /api/inventory/products — admin only, create a new product */
-router.post('/products', requireAuth, requireRole('admin'), (req, res, next) => {
+router.post('/products', requireAuth, requireRole('admin'), async (req, res, next) => {
   try {
-    const product = inventory.createProduct(req.body || {});
+    const product = await inventory.createProduct(req.body || {});
     res.status(201).json({ product });
   } catch (err) { next(err); }
 });
 
-/**
- * PUT /api/inventory/products/:id — update name/status/price/reorder point
- * (also accepts availableSupplies for manual stock corrections by admin).
- */
-router.put('/products/:id', requireAuth, (req, res, next) => {
+router.put('/products/:id', requireAuth, async (req, res, next) => {
   try {
     const patch = { ...(req.body || {}) };
-    // Stock corrections are admin-only; staff may only toggle status/reorder
     if (req.user.role !== 'admin' && patch.availableSupplies !== undefined) {
       return res.status(403).json({ error: 'Only admins can adjust stock directly' });
     }
-    const product = inventory.updateProduct(req.params.id, patch);
+    const product = await inventory.updateProduct(req.params.id, patch);
     res.json({ product });
   } catch (err) { next(err); }
 });
 
-/** DELETE /api/inventory/products/:id — admin only */
 router.delete(
   '/products/:id',
   requireAuth,
   requireRole('admin'),
-  (req, res, next) => {
+  async (req, res, next) => {
     try {
-      res.json(inventory.deleteProduct(req.params.id));
+      res.json(await inventory.deleteProduct(req.params.id));
     } catch (err) { next(err); }
   }
 );
 
-/**
- * POST /api/inventory/pickup
- * Body: { productId, quantity, pickupDate? }
- * Deducts stock atomically and appends a pickup transaction.
- */
-router.post('/pickup', requireAuth, (req, res, next) => {
+router.post('/pickup', requireAuth, async (req, res, next) => {
   try {
     const { productId, quantity, pickupDate } = req.body || {};
     if (!productId) {
       return res.status(400).json({ error: 'productId is required' });
     }
-    const result = inventory.recordPickup({
+    const result = await inventory.recordPickup({
       productId,
       quantity,
       pickupDate,
@@ -74,18 +61,13 @@ router.post('/pickup', requireAuth, (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-/**
- * POST /api/inventory/restock
- * Body: { productId, quantity, restockDate? }
- * Atomically adds stock and appends a RESTOCK transaction.
- */
-router.post('/restock', requireAuth, (req, res, next) => {
+router.post('/restock', requireAuth, async (req, res, next) => {
   try {
     const { productId, quantity, restockDate } = req.body || {};
     if (!productId) {
       return res.status(400).json({ error: 'productId is required' });
     }
-    const result = inventory.recordRestock({
+    const result = await inventory.recordRestock({
       productId,
       quantity,
       restockDate,
@@ -95,20 +77,18 @@ router.post('/restock', requireAuth, (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-/** GET /api/inventory/transactions?date=YYYY-MM-DD&type=PICKUP|RESTOCK */
-router.get('/transactions', requireAuth, (req, res, next) => {
+router.get('/transactions', requireAuth, async (req, res, next) => {
   try {
     const { date, type } = req.query;
     res.json({
-      transactions: inventory.listTransactions({ date, type }),
+      transactions: await inventory.listTransactions({ date, type }),
     });
   } catch (err) { next(err); }
 });
 
-/** GET /api/inventory/summary — counts for dashboard cards */
-router.get('/summary', requireAuth, (req, res, next) => {
+router.get('/summary', requireAuth, async (req, res, next) => {
   try {
-    res.json(inventory.summary());
+    res.json(await inventory.summary());
   } catch (err) { next(err); }
 });
 

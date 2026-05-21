@@ -57,19 +57,30 @@ class GoogleSheetsService {
   async init() {
     if (this.initialised) return;
 
-    const credPath = path.resolve(config.google.credentialsPath);
-    if (!fs.existsSync(credPath)) {
-      throw new Error(
-        `Google credentials file not found at "${credPath}". ` +
-          `See SETUP.md for how to create a service account key.`
-      );
+    const authOptions = {
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    };
+
+    if (config.google.credentialsJson) {
+      // Preferred for serverless: the service-account JSON lives in
+      // an env var (GOOGLE_CREDENTIALS_JSON) — no file on disk.
+      try {
+        authOptions.credentials = JSON.parse(config.google.credentialsJson);
+      } catch (err) {
+        throw new Error(`Invalid GOOGLE_CREDENTIALS_JSON env var: ${err.message}`);
+      }
+    } else {
+      const credPath = path.resolve(config.google.credentialsPath);
+      if (!fs.existsSync(credPath)) {
+        throw new Error(
+          `No Google credentials. Set GOOGLE_CREDENTIALS_JSON (preferred) ` +
+          `or place a service-account JSON at "${credPath}".`
+        );
+      }
+      authOptions.keyFile = credPath;
     }
 
-    const auth = new GoogleAuth({
-      keyFile: credPath,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-
+    const auth = new GoogleAuth(authOptions);
     const authClient = await auth.getClient();
     this.sheets = google.sheets({ version: 'v4', auth: authClient });
     this.initialised = true;
@@ -88,7 +99,7 @@ class GoogleSheetsService {
 
     await this.init();
 
-    const tabs = sheetConfig.getTabs();
+    const tabs = await sheetConfig.getTabs();
     const rows = [];
     this.index.clear();
 

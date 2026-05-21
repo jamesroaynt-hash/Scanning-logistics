@@ -9,11 +9,6 @@ import history from '../services/scanHistory.service.js';
 import sheetConfig from '../services/sheetConfig.service.js';
 import { requireAuth, requireRole } from '../middleware/auth.middleware.js';
 
-/** Decorate a history row with the friendly sheet label. */
-function withLabel(row) {
-  return { ...row, sheetLabel: sheetConfig.labelFor(row.sourceTab) };
-}
-
 const router = Router();
 
 // Statuses the system recognises. Kept server-side as the source of truth.
@@ -25,6 +20,15 @@ export const VALID_STATUSES = [
   'Failed Delivery',
 ];
 
+function makeLabelLookup(tabs) {
+  const map = new Map();
+  for (const t of tabs) map.set(t.name.toLowerCase(), t.label);
+  return (name) => {
+    if (!name) return name;
+    return map.get(String(name).toLowerCase()) || name;
+  };
+}
+
 /**
  * GET /api/parcels/scan/:tracking
  * Primary hot path. Looks up a parcel and logs the scan.
@@ -34,7 +38,7 @@ router.get('/scan/:tracking', requireAuth, async (req, res, next) => {
     const tracking = req.params.tracking;
     const parcel = await sheets.findByTracking(tracking);
 
-    const { duplicate } = history.add({
+    const { duplicate } = await history.add({
       trackingNumber: tracking,
       operator: req.user.username,
       found: Boolean(parcel),
@@ -155,7 +159,7 @@ router.get('/dashboard', requireAuth, async (req, res, next) => {
 
     res.json({
       ...counts,
-      ...history.statsForToday(),
+      ...(await history.statsForToday()),
     });
   } catch (err) {
     next(err);
@@ -171,7 +175,14 @@ router.get('/history', requireAuth, async (req, res, next) => {
     if (req.user.role !== 'admin') {
       filter.operator = req.user.username;
     }
-    res.json({ history: history.list(filter).map(withLabel) });
+    const [list, tabs] = await Promise.all([
+      history.list(filter),
+      sheetConfig.getTabs(),
+    ]);
+    const labelFor = makeLabelLookup(tabs);
+    res.json({
+      history: list.map((row) => ({ ...row, sheetLabel: labelFor(row.sourceTab) })),
+    });
   } catch (err) {
     next(err);
   }
@@ -182,20 +193,22 @@ router.get(
   '/history/stats',
   requireAuth,
   requireRole('admin'),
-  (req, res) => {
-    res.json(history.dbStats());
+  async (req, res, next) => {
+    try {
+      res.json(await history.dbStats());
+    } catch (err) { next(err); }
   }
 );
 
 /**
  * GET /api/parcels/history/export?from=YYYY-MM-DD&to=YYYY-MM-DD
- * Streams the scan log as CSV. Admin-only.
+ * Returns the scan log as CSV. Admin-only.
  */
 router.get(
   '/history/export',
   requireAuth,
   requireRole('admin'),
-  (req, res, next) => {
+  async (req, res, next) => {
     try {
       const { from, to } = req.query;
       const stamp = new Date().toISOString().slice(0, 10);
@@ -217,7 +230,13 @@ router.get(
       ];
       res.write(cols.join(',') + '\n');
 
-      for (const e of history.iter({ from, to })) {
+      const [entries, tabs] = await Promise.all([
+        history.listAll({ from, to }),
+        sheetConfig.getTabs(),
+      ]);
+      const labelFor = makeLabelLookup(tabs);
+
+      for (const e of entries) {
         res.write(
           [
             e.timestamp,
@@ -226,7 +245,7 @@ router.get(
             e.found ? 1 : 0,
             e.status,
             e.sourceTab,
-            sheetConfig.labelFor(e.sourceTab),
+            labelFor(e.sourceTab),
             e.customer,
             e.product,
             e.duplicate ? 1 : 0,

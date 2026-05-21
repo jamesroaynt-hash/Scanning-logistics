@@ -1,145 +1,161 @@
 /**
- * ScanHistoryService
- * ------------------
- * Every scan is persisted to SQLite so it survives restarts and can be
- * backed up by copying the .sqlite file. Reads are served straight from
- * the DB; today's-stats are computed via indexed SQL counts.
+ * ScanHistoryService — persists every scan to public.scan_records.
+ *
+ * The shared schema stores the operator as an int FK (scanned_by →
+ * users.id). We look up the FK on every insert from the JWT username.
+ * If a username has no matching row, scanned_by stays NULL — the
+ * scan is still recorded, the audit trail just lacks a user link.
  */
 import { randomUUID } from 'crypto';
 import db from './db.service.js';
 
-const insertStmt = db.prepare(`
-  INSERT INTO scans
-    (id, tracking_number, operator, found, status, source_tab, customer, product, duplicate, timestamp, scan_date)
-  VALUES
-    (@id, @trackingNumber, @operator, @found, @status, @sourceTab, @customer, @product, @duplicate, @timestamp, @scanDate)
-`);
-
-const dupCheckStmt = db.prepare(`
-  SELECT 1 FROM scans WHERE tracking_number = ? AND scan_date = ? LIMIT 1
-`);
-
-const statsTodayStmt = db.prepare(`
-  SELECT
-    COUNT(*) AS total,
-    COUNT(DISTINCT tracking_number) AS unique_count
-  FROM scans
-  WHERE scan_date = ?
-`);
-
-const totalRowsStmt = db.prepare(`SELECT COUNT(*) AS n FROM scans`);
-const firstScanStmt = db.prepare(`SELECT MIN(timestamp) AS t FROM scans`);
-const lastScanStmt = db.prepare(`SELECT MAX(timestamp) AS t FROM scans`);
+async function userIdByUsername(username) {
+  if (!username) return null;
+  const { rows } = await db.query(
+    'SELECT id FROM public.users WHERE username = $1 LIMIT 1',
+    [username]
+  );
+  return rows[0]?.id ?? null;
+}
 
 function rowToEntry(row) {
   if (!row) return null;
+  const ts = row.created_at instanceof Date
+    ? row.created_at.toISOString()
+    : row.created_at;
   return {
-    id: row.id,
-    trackingNumber: row.tracking_number,
-    operator: row.operator,
-    found: Boolean(row.found),
+    id: row.scan_ref,
+    trackingNumber: row.tracking_no,
+    operator: row.operator_username || 'unknown',
+    found: row.found ?? true,
     status: row.status,
     sourceTab: row.source_tab,
     customer: row.customer,
     product: row.product,
-    duplicate: Boolean(row.duplicate),
-    timestamp: row.timestamp,
+    duplicate: row.duplicate ?? false,
+    timestamp: ts,
   };
 }
 
 class ScanHistoryService {
   /**
-   * Record a scan. Returns { entry, duplicate } — duplicate is true if
-   * the same tracking number was already scanned today.
+   * Insert a scan row. Returns { entry, duplicate } — duplicate is
+   * true if the same tracking_no was already scanned today.
    */
-  add({ trackingNumber, operator, found, status, sourceTab, customer, product }) {
-    const now = new Date();
-    const timestamp = now.toISOString();
-    const scanDate = timestamp.slice(0, 10);
+  async add({ trackingNumber, operator, found, status, sourceTab, customer, product }) {
+    const scanDate = new Date().toISOString().slice(0, 10);
 
-    const duplicate = Boolean(dupCheckStmt.get(trackingNumber, scanDate));
+    const dupCheck = await db.query(
+      'SELECT 1 FROM public.scan_records WHERE tracking_no = $1 AND scan_date = $2 LIMIT 1',
+      [trackingNumber, scanDate]
+    );
+    const duplicate = dupCheck.rows.length > 0;
 
-    const entry = {
-      id: randomUUID(),
-      trackingNumber,
-      operator: operator || 'unknown',
-      found: Boolean(found),
-      status: status || null,
-      sourceTab: sourceTab || null,
-      customer: customer || null,
-      product: product || null,
-      timestamp,
+    const scanRef = randomUUID();
+    const userId = await userIdByUsername(operator);
+    const scanTime = new Date().toISOString().slice(11, 19);
+
+    const { rows } = await db.query(
+      `INSERT INTO public.scan_records
+         (scan_ref, tracking_no, customer, scan_date, scan_time, status, scan_type,
+          scanned_by, product, source_tab, found, duplicate)
+       VALUES
+         ($1, $2, $3, $4, $5, $6, 'Standard', $7, $8, $9, $10, $11)
+       RETURNING scan_ref, tracking_no, customer, status, source_tab, product,
+                 found, duplicate, created_at`,
+      [
+        scanRef,
+        trackingNumber,
+        customer || null,
+        scanDate,
+        scanTime,
+        status || null,
+        userId,
+        product || null,
+        sourceTab || null,
+        Boolean(found),
+        duplicate,
+      ]
+    );
+
+    return {
+      entry: rowToEntry({ ...rows[0], operator_username: operator || 'unknown' }),
       duplicate,
     };
-
-    insertStmt.run({
-      id: entry.id,
-      trackingNumber: entry.trackingNumber,
-      operator: entry.operator,
-      found: entry.found ? 1 : 0,
-      status: entry.status,
-      sourceTab: entry.sourceTab,
-      customer: entry.customer,
-      product: entry.product,
-      duplicate: entry.duplicate ? 1 : 0,
-      timestamp: entry.timestamp,
-      scanDate,
-    });
-
-    return { entry, duplicate };
   }
 
-  /**
-   * List scans (newest first). Supports filtering by operator, date,
-   * and an optional date range used by the CSV backup.
-   */
-  list({ operator, date, from, to, limit = 500 } = {}) {
+  async list({ operator, date, from, to, limit = 500 } = {}) {
     const where = [];
     const params = [];
-
-    if (operator) { where.push('operator = ?'); params.push(operator); }
-    if (date)     { where.push('scan_date = ?'); params.push(date); }
-    if (from)     { where.push('scan_date >= ?'); params.push(from); }
-    if (to)       { where.push('scan_date <= ?'); params.push(to); }
-
+    if (operator) { params.push(operator); where.push(`u.username = $${params.length}`); }
+    if (date)     { params.push(date);     where.push(`s.scan_date = $${params.length}`); }
+    if (from)     { params.push(from);     where.push(`s.scan_date >= $${params.length}`); }
+    if (to)       { params.push(to);       where.push(`s.scan_date <= $${params.length}`); }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const sql = `
-      SELECT * FROM scans
-      ${clause}
-      ORDER BY timestamp DESC
-      LIMIT ?
-    `;
     params.push(limit);
 
-    return db.prepare(sql).all(...params).map(rowToEntry);
+    const { rows } = await db.query(
+      `SELECT s.scan_ref, s.tracking_no, s.customer, s.status, s.source_tab,
+              s.product, s.found, s.duplicate, s.created_at,
+              u.username AS operator_username
+         FROM public.scan_records s
+         LEFT JOIN public.users u ON u.id = s.scanned_by
+         ${clause}
+        ORDER BY s.created_at DESC
+        LIMIT $${params.length}`,
+      params
+    );
+    return rows.map(rowToEntry);
   }
 
-  /** Async-style iterator for streaming CSV without loading everything. */
-  *iter({ operator, from, to } = {}) {
+  /** Same as list() but without a limit — used by the CSV export. */
+  async listAll({ operator, from, to } = {}) {
     const where = [];
     const params = [];
-    if (operator) { where.push('operator = ?'); params.push(operator); }
-    if (from)     { where.push('scan_date >= ?'); params.push(from); }
-    if (to)       { where.push('scan_date <= ?'); params.push(to); }
+    if (operator) { params.push(operator); where.push(`u.username = $${params.length}`); }
+    if (from)     { params.push(from);     where.push(`s.scan_date >= $${params.length}`); }
+    if (to)       { params.push(to);       where.push(`s.scan_date <= $${params.length}`); }
     const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const stmt = db.prepare(`SELECT * FROM scans ${clause} ORDER BY timestamp DESC`);
-    for (const row of stmt.iterate(...params)) yield rowToEntry(row);
+
+    const { rows } = await db.query(
+      `SELECT s.scan_ref, s.tracking_no, s.customer, s.status, s.source_tab,
+              s.product, s.found, s.duplicate, s.created_at,
+              u.username AS operator_username
+         FROM public.scan_records s
+         LEFT JOIN public.users u ON u.id = s.scanned_by
+         ${clause}
+        ORDER BY s.created_at DESC`,
+      params
+    );
+    return rows.map(rowToEntry);
   }
 
-  statsForToday() {
+  async statsForToday() {
     const today = new Date().toISOString().slice(0, 10);
-    const r = statsTodayStmt.get(today);
+    const { rows } = await db.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(DISTINCT tracking_no)::int AS unique_count
+         FROM public.scan_records
+        WHERE scan_date = $1`,
+      [today]
+    );
     return {
-      totalScannedToday: r?.total ?? 0,
-      uniqueScannedToday: r?.unique_count ?? 0,
+      totalScannedToday: rows[0]?.total ?? 0,
+      uniqueScannedToday: rows[0]?.unique_count ?? 0,
     };
   }
 
-  dbStats() {
+  async dbStats() {
+    const { rows } = await db.query(
+      `SELECT COUNT(*)::int AS total,
+              MIN(created_at) AS first_scan,
+              MAX(created_at) AS last_scan
+         FROM public.scan_records`
+    );
     return {
-      total: totalRowsStmt.get().n,
-      firstScan: firstScanStmt.get().t,
-      lastScan: lastScanStmt.get().t,
+      total: rows[0]?.total ?? 0,
+      firstScan: rows[0]?.first_scan,
+      lastScan: rows[0]?.last_scan,
     };
   }
 }

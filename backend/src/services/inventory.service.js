@@ -1,108 +1,37 @@
 /**
- * InventoryService
- * ----------------
- * Product catalogue + pickup ledger backed by SQLite. Stock math runs
- * inside transactions so a pickup can never produce negative inventory
- * even if two operators submit at once.
+ * InventoryService — product catalogue + pickup/restock ledger.
  *
- * Tables:
- *  - products              (catalogue + running counters)
- *  - pickup_transactions   (append-only ledger of every deduction)
+ * Backed by public.inventory + public.inventory_logs. The app's
+ * external product ID is `item_id` (a text UUID we generate); the
+ * integer `inventory.id` PK is internal to Postgres and unused.
+ *
+ * Stock changes happen inside a SELECT ... FOR UPDATE transaction
+ * so a pickup can never produce negative stock under concurrent
+ * submits.
  */
 import { randomUUID } from 'crypto';
 import db from './db.service.js';
 
+const ACTIVE = 'ACTIVE';
+const INACTIVE = 'INACTIVE';
 const LOW_STOCK = 'LOW STOCK';
 const NORMAL = 'NORMAL';
 
-const insertProductStmt = db.prepare(`
-  INSERT INTO products
-    (id, name, available_supplies, shipped_count, status, price_per_qty, reorder_point, created_at, updated_at)
-  VALUES
-    (@id, @name, @availableSupplies, 0, @status, @pricePerQty, @reorderPoint, @createdAt, @updatedAt)
-`);
-
-const updateProductStmt = db.prepare(`
-  UPDATE products
-     SET name = @name,
-         available_supplies = @availableSupplies,
-         status = @status,
-         price_per_qty = @pricePerQty,
-         reorder_point = @reorderPoint,
-         updated_at = @updatedAt
-   WHERE id = @id
-`);
-
-const getProductStmt = db.prepare(`SELECT * FROM products WHERE id = ?`);
-const getProductByNameStmt = db.prepare(
-  `SELECT * FROM products WHERE LOWER(name) = LOWER(?)`
-);
-const listProductsStmt = db.prepare(`SELECT * FROM products ORDER BY name ASC`);
-const deleteProductStmt = db.prepare(`DELETE FROM products WHERE id = ?`);
-
-const insertPickupStmt = db.prepare(`
-  INSERT INTO pickup_transactions
-    (id, product_id, product_name, quantity, operator, pickup_date, timestamp, type)
-  VALUES
-    (@id, @productId, @productName, @quantity, @operator, @pickupDate, @timestamp, @type)
-`);
-
-const deductStockStmt = db.prepare(`
-  UPDATE products
-     SET available_supplies = available_supplies - @quantity,
-         shipped_count      = shipped_count + @quantity,
-         updated_at         = @updatedAt
-   WHERE id = @id
-     AND available_supplies >= @quantity
-     AND status = 'ACTIVE'
-`);
-
-const addStockStmt = db.prepare(`
-  UPDATE products
-     SET available_supplies = available_supplies + @quantity,
-         updated_at         = @updatedAt
-   WHERE id = @id
-`);
-
-const listTransactionsStmt = db.prepare(`
-  SELECT * FROM pickup_transactions
-   WHERE (@date IS NULL OR pickup_date = @date)
-     AND (@type IS NULL OR type = @type)
-   ORDER BY timestamp DESC
-   LIMIT 500
-`);
-
-const summaryStmt = db.prepare(`
-  SELECT
-    COUNT(*)                                                AS total_products,
-    SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END)      AS active_products,
-    SUM(CASE WHEN available_supplies <= reorder_point
-              AND status = 'ACTIVE' THEN 1 ELSE 0 END)      AS low_stock_items
-  FROM products
-`);
-
-const shippedTodayStmt = db.prepare(`
-  SELECT COALESCE(SUM(quantity), 0) AS total
-    FROM pickup_transactions
-   WHERE pickup_date = ?
-`);
-
-function notifyStatus(row) {
-  if (row.status !== 'ACTIVE') return NORMAL;
-  return row.available_supplies <= row.reorder_point ? LOW_STOCK : NORMAL;
-}
-
 function rowToProduct(row) {
   if (!row) return null;
+  const status = row.status || ACTIVE;
+  const stock = row.stock ?? 0;
+  const reorderPt = row.reorder_pt ?? 0;
+  const notify = status !== ACTIVE ? NORMAL : (stock <= reorderPt ? LOW_STOCK : NORMAL);
   return {
-    id: row.id,
+    id: row.item_id,
     name: row.name,
-    availableSupplies: row.available_supplies,
-    shippedCount: row.shipped_count,
-    status: row.status,
-    pricePerQty: row.price_per_qty,
-    reorderPoint: row.reorder_point,
-    notifyStatus: notifyStatus(row),
+    availableSupplies: stock,
+    shippedCount: row.shipped_count ?? 0,
+    status,
+    pricePerQty: row.sell_price ?? 0,
+    reorderPoint: reorderPt,
+    notifyStatus: notify,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -110,212 +39,20 @@ function rowToProduct(row) {
 
 function rowToTransaction(row) {
   if (!row) return null;
+  const type = row.action === 'add' ? 'RESTOCK' : 'PICKUP';
+  const ts = row.created_at instanceof Date
+    ? row.created_at.toISOString()
+    : row.created_at;
   return {
-    id: row.id,
-    productId: row.product_id,
-    productName: row.product_name,
-    quantity: row.quantity,
-    operator: row.operator,
-    pickupDate: row.pickup_date,
-    timestamp: row.timestamp,
-    type: row.type || 'PICKUP',
+    id: String(row.id),
+    productId: row.item_id,
+    productName: row.product_name || row.name || '',
+    quantity: Math.abs(row.qty_change ?? 0),
+    operator: row.operator_username || 'unknown',
+    pickupDate: row.pickup_date || (typeof ts === 'string' ? ts.slice(0, 10) : null),
+    timestamp: ts,
+    type,
   };
-}
-
-function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-class InventoryService {
-  listProducts() {
-    return listProductsStmt.all().map(rowToProduct);
-  }
-
-  getProduct(id) {
-    return rowToProduct(getProductStmt.get(id));
-  }
-
-  createProduct({ name, availableSupplies, pricePerQty, reorderPoint, status }) {
-    const cleanName = String(name || '').trim();
-    if (!cleanName) throw badRequest('Product name is required');
-    if (getProductByNameStmt.get(cleanName)) {
-      throw badRequest(`Product "${cleanName}" already exists`);
-    }
-    const now = new Date().toISOString();
-    const row = {
-      id: randomUUID(),
-      name: cleanName,
-      availableSupplies: nonNegativeInt(availableSupplies, 'availableSupplies'),
-      status: status === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE',
-      pricePerQty: nonNegativeNum(pricePerQty, 'pricePerQty'),
-      reorderPoint: nonNegativeInt(reorderPoint, 'reorderPoint'),
-      createdAt: now,
-      updatedAt: now,
-    };
-    insertProductStmt.run(row);
-    return this.getProduct(row.id);
-  }
-
-  updateProduct(id, patch) {
-    const existing = getProductStmt.get(id);
-    if (!existing) throw notFound('Product not found');
-
-    const next = {
-      id,
-      name: patch.name !== undefined
-        ? String(patch.name).trim() || existing.name
-        : existing.name,
-      availableSupplies: patch.availableSupplies !== undefined
-        ? nonNegativeInt(patch.availableSupplies, 'availableSupplies')
-        : existing.available_supplies,
-      status: patch.status !== undefined
-        ? (patch.status === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE')
-        : existing.status,
-      pricePerQty: patch.pricePerQty !== undefined
-        ? nonNegativeNum(patch.pricePerQty, 'pricePerQty')
-        : existing.price_per_qty,
-      reorderPoint: patch.reorderPoint !== undefined
-        ? nonNegativeInt(patch.reorderPoint, 'reorderPoint')
-        : existing.reorder_point,
-      updatedAt: new Date().toISOString(),
-    };
-
-    if (next.name.toLowerCase() !== existing.name.toLowerCase()) {
-      const clash = getProductByNameStmt.get(next.name);
-      if (clash && clash.id !== id) {
-        throw badRequest(`Another product already uses "${next.name}"`);
-      }
-    }
-
-    updateProductStmt.run(next);
-    return this.getProduct(id);
-  }
-
-  deleteProduct(id) {
-    const existing = getProductStmt.get(id);
-    if (!existing) throw notFound('Product not found');
-    deleteProductStmt.run(id);
-    return { id };
-  }
-
-  /**
-   * Atomically deduct stock and append a pickup transaction. The UPDATE
-   * has a `available_supplies >= quantity AND status = 'ACTIVE'` guard so
-   * concurrent submissions cannot push the count below zero.
-   */
-  recordPickup({ productId, quantity, operator, pickupDate }) {
-    const qty = nonNegativeInt(quantity, 'quantity');
-    if (qty <= 0) throw badRequest('Quantity must be greater than zero');
-
-    const date = (pickupDate && /^\d{4}-\d{2}-\d{2}$/.test(pickupDate))
-      ? pickupDate
-      : todayISO();
-
-    const tx = db.transaction(() => {
-      const product = getProductStmt.get(productId);
-      if (!product) throw notFound('Product not found');
-      if (product.status !== 'ACTIVE') {
-        throw badRequest('Product is inactive');
-      }
-      if (product.available_supplies < qty) {
-        throw badRequest(
-          `Only ${product.available_supplies} available — cannot pick up ${qty}`
-        );
-      }
-
-      const result = deductStockStmt.run({
-        id: productId,
-        quantity: qty,
-        updatedAt: new Date().toISOString(),
-      });
-      if (result.changes === 0) {
-        throw badRequest('Stock changed during submit — please retry');
-      }
-
-      const entry = {
-        id: randomUUID(),
-        productId,
-        productName: product.name,
-        quantity: qty,
-        operator: operator || 'unknown',
-        pickupDate: date,
-        timestamp: new Date().toISOString(),
-        type: 'PICKUP',
-      };
-      insertPickupStmt.run(entry);
-      return entry;
-    });
-
-    const entry = tx();
-    return {
-      transaction: entry,
-      product: this.getProduct(productId),
-    };
-  }
-
-  /**
-   * Atomically add stock to a product and append a RESTOCK transaction.
-   * Works for ACTIVE or INACTIVE products (so admins can replenish a
-   * paused SKU without flipping its status first).
-   */
-  recordRestock({ productId, quantity, operator, restockDate }) {
-    const qty = nonNegativeInt(quantity, 'quantity');
-    if (qty <= 0) throw badRequest('Quantity must be greater than zero');
-
-    const date = (restockDate && /^\d{4}-\d{2}-\d{2}$/.test(restockDate))
-      ? restockDate
-      : todayISO();
-
-    const tx = db.transaction(() => {
-      const product = getProductStmt.get(productId);
-      if (!product) throw notFound('Product not found');
-
-      const result = addStockStmt.run({
-        id: productId,
-        quantity: qty,
-        updatedAt: new Date().toISOString(),
-      });
-      if (result.changes === 0) {
-        throw badRequest('Failed to restock — please retry');
-      }
-
-      const entry = {
-        id: randomUUID(),
-        productId,
-        productName: product.name,
-        quantity: qty,
-        operator: operator || 'unknown',
-        pickupDate: date,
-        timestamp: new Date().toISOString(),
-        type: 'RESTOCK',
-      };
-      insertPickupStmt.run(entry);
-      return entry;
-    });
-
-    const entry = tx();
-    return {
-      transaction: entry,
-      product: this.getProduct(productId),
-    };
-  }
-
-  listTransactions({ date, type } = {}) {
-    return listTransactionsStmt
-      .all({ date: date || null, type: type || null })
-      .map(rowToTransaction);
-  }
-
-  summary() {
-    const s = summaryStmt.get() || {};
-    const t = shippedTodayStmt.get(todayISO()) || {};
-    return {
-      totalProducts: s.total_products || 0,
-      activeProducts: s.active_products || 0,
-      lowStockItems: s.low_stock_items || 0,
-      shippedToday: t.total || 0,
-    };
-  }
 }
 
 function badRequest(msg) {
@@ -341,6 +78,303 @@ function nonNegativeNum(v, field) {
     throw badRequest(`${field} must be a non-negative number`);
   }
   return n;
+}
+function todayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function userIdByUsername(client, username) {
+  if (!username) return null;
+  const { rows } = await client.query(
+    'SELECT id FROM public.users WHERE username = $1 LIMIT 1',
+    [username]
+  );
+  return rows[0]?.id ?? null;
+}
+
+const PRODUCT_COLS = `
+  item_id, name, stock, shipped_count, status, sell_price, reorder_pt,
+  created_at, updated_at
+`;
+
+class InventoryService {
+  async listProducts() {
+    const { rows } = await db.query(
+      `SELECT ${PRODUCT_COLS}
+         FROM public.inventory
+        ORDER BY name ASC`
+    );
+    return rows.map(rowToProduct);
+  }
+
+  async getProduct(id) {
+    const { rows } = await db.query(
+      `SELECT ${PRODUCT_COLS}
+         FROM public.inventory
+        WHERE item_id = $1`,
+      [id]
+    );
+    return rowToProduct(rows[0]);
+  }
+
+  async _getByName(name) {
+    const { rows } = await db.query(
+      `SELECT ${PRODUCT_COLS}
+         FROM public.inventory
+        WHERE LOWER(name) = LOWER($1)`,
+      [name]
+    );
+    return rows[0] || null;
+  }
+
+  async createProduct({ name, availableSupplies, pricePerQty, reorderPoint, status }) {
+    const cleanName = String(name || '').trim();
+    if (!cleanName) throw badRequest('Product name is required');
+    if (await this._getByName(cleanName)) {
+      throw badRequest(`Product "${cleanName}" already exists`);
+    }
+
+    const itemId = randomUUID();
+    const stock = nonNegativeInt(availableSupplies, 'availableSupplies');
+    const sellPrice = nonNegativeNum(pricePerQty, 'pricePerQty');
+    const reorderPt = nonNegativeInt(reorderPoint, 'reorderPoint');
+    const cleanStatus = status === INACTIVE ? INACTIVE : ACTIVE;
+    const now = new Date().toISOString();
+
+    await db.query(
+      `INSERT INTO public.inventory
+         (item_id, name, type, unit, stock, reorder_pt, sell_price, status,
+          shipped_count, created_at, updated_at)
+       VALUES ($1, $2, 'Product', 'pcs', $3, $4, $5, $6, 0, $7, $7)`,
+      [itemId, cleanName, stock, reorderPt, sellPrice, cleanStatus, now]
+    );
+    return this.getProduct(itemId);
+  }
+
+  async updateProduct(id, patch) {
+    const existing = await this.getProduct(id);
+    if (!existing) throw notFound('Product not found');
+
+    const next = {
+      name: patch.name !== undefined
+        ? (String(patch.name).trim() || existing.name)
+        : existing.name,
+      availableSupplies: patch.availableSupplies !== undefined
+        ? nonNegativeInt(patch.availableSupplies, 'availableSupplies')
+        : existing.availableSupplies,
+      status: patch.status !== undefined
+        ? (patch.status === INACTIVE ? INACTIVE : ACTIVE)
+        : existing.status,
+      pricePerQty: patch.pricePerQty !== undefined
+        ? nonNegativeNum(patch.pricePerQty, 'pricePerQty')
+        : existing.pricePerQty,
+      reorderPoint: patch.reorderPoint !== undefined
+        ? nonNegativeInt(patch.reorderPoint, 'reorderPoint')
+        : existing.reorderPoint,
+    };
+
+    if (next.name.toLowerCase() !== existing.name.toLowerCase()) {
+      const clash = await this._getByName(next.name);
+      if (clash && clash.item_id !== id) {
+        throw badRequest(`Another product already uses "${next.name}"`);
+      }
+    }
+
+    await db.query(
+      `UPDATE public.inventory
+          SET name = $1, stock = $2, status = $3, sell_price = $4,
+              reorder_pt = $5, updated_at = now()
+        WHERE item_id = $6`,
+      [next.name, next.availableSupplies, next.status, next.pricePerQty,
+       next.reorderPoint, id]
+    );
+    return this.getProduct(id);
+  }
+
+  async deleteProduct(id) {
+    const existing = await this.getProduct(id);
+    if (!existing) throw notFound('Product not found');
+    await db.query('DELETE FROM public.inventory WHERE item_id = $1', [id]);
+    return { id };
+  }
+
+  async recordPickup({ productId, quantity, operator, pickupDate }) {
+    const qty = nonNegativeInt(quantity, 'quantity');
+    if (qty <= 0) throw badRequest('Quantity must be greater than zero');
+
+    const date = (pickupDate && /^\d{4}-\d{2}-\d{2}$/.test(pickupDate))
+      ? pickupDate
+      : todayISO();
+
+    return db.withTransaction(async (client) => {
+      const { rows } = await client.query(
+        `SELECT item_id, name, stock, status
+           FROM public.inventory
+          WHERE item_id = $1
+            FOR UPDATE`,
+        [productId]
+      );
+      const product = rows[0];
+      if (!product) throw notFound('Product not found');
+      if (product.status !== ACTIVE) throw badRequest('Product is inactive');
+      if (product.stock < qty) {
+        throw badRequest(
+          `Only ${product.stock} available — cannot pick up ${qty}`
+        );
+      }
+
+      const qtyBefore = product.stock;
+      const qtyAfter = qtyBefore - qty;
+
+      await client.query(
+        `UPDATE public.inventory
+            SET stock = $1,
+                shipped_count = shipped_count + $2,
+                updated_at = now()
+          WHERE item_id = $3`,
+        [qtyAfter, qty, productId]
+      );
+
+      const userId = await userIdByUsername(client, operator);
+
+      const ins = await client.query(
+        `INSERT INTO public.inventory_logs
+           (item_id, action, qty_before, qty_change, qty_after,
+            created_by, pickup_date, notes)
+         VALUES ($1, 'remove', $2, $3, $4, $5, $6, $7)
+         RETURNING id, item_id, action, qty_change, pickup_date, created_at`,
+        [productId, qtyBefore, -qty, qtyAfter, userId, date,
+         `Pickup by ${operator || 'unknown'}`]
+      );
+
+      const updated = await client.query(
+        `SELECT ${PRODUCT_COLS}
+           FROM public.inventory WHERE item_id = $1`,
+        [productId]
+      );
+
+      return {
+        transaction: rowToTransaction({
+          ...ins.rows[0],
+          product_name: product.name,
+          operator_username: operator,
+        }),
+        product: rowToProduct(updated.rows[0]),
+      };
+    });
+  }
+
+  async recordRestock({ productId, quantity, operator, restockDate }) {
+    const qty = nonNegativeInt(quantity, 'quantity');
+    if (qty <= 0) throw badRequest('Quantity must be greater than zero');
+
+    const date = (restockDate && /^\d{4}-\d{2}-\d{2}$/.test(restockDate))
+      ? restockDate
+      : todayISO();
+
+    return db.withTransaction(async (client) => {
+      const { rows } = await client.query(
+        `SELECT item_id, name, stock, status
+           FROM public.inventory
+          WHERE item_id = $1
+            FOR UPDATE`,
+        [productId]
+      );
+      const product = rows[0];
+      if (!product) throw notFound('Product not found');
+
+      const qtyBefore = product.stock;
+      const qtyAfter = qtyBefore + qty;
+
+      await client.query(
+        `UPDATE public.inventory
+            SET stock = $1, updated_at = now()
+          WHERE item_id = $2`,
+        [qtyAfter, productId]
+      );
+
+      const userId = await userIdByUsername(client, operator);
+
+      const ins = await client.query(
+        `INSERT INTO public.inventory_logs
+           (item_id, action, qty_before, qty_change, qty_after,
+            created_by, pickup_date, notes)
+         VALUES ($1, 'add', $2, $3, $4, $5, $6, $7)
+         RETURNING id, item_id, action, qty_change, pickup_date, created_at`,
+        [productId, qtyBefore, qty, qtyAfter, userId, date,
+         `Restock by ${operator || 'unknown'}`]
+      );
+
+      const updated = await client.query(
+        `SELECT ${PRODUCT_COLS}
+           FROM public.inventory WHERE item_id = $1`,
+        [productId]
+      );
+
+      return {
+        transaction: rowToTransaction({
+          ...ins.rows[0],
+          product_name: product.name,
+          operator_username: operator,
+        }),
+        product: rowToProduct(updated.rows[0]),
+      };
+    });
+  }
+
+  async listTransactions({ date, type } = {}) {
+    const where = [];
+    const params = [];
+    if (date) {
+      params.push(date);
+      where.push(`l.pickup_date = $${params.length}`);
+    }
+    if (type) {
+      const action = type === 'RESTOCK' ? 'add' : (type === 'PICKUP' ? 'remove' : null);
+      if (action) {
+        params.push(action);
+        where.push(`l.action = $${params.length}`);
+      }
+    }
+    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const { rows } = await db.query(
+      `SELECT l.id, l.item_id, l.action, l.qty_change, l.pickup_date,
+              l.created_at, l.created_by,
+              i.name AS product_name,
+              u.username AS operator_username
+         FROM public.inventory_logs l
+         LEFT JOIN public.inventory i ON i.item_id = l.item_id
+         LEFT JOIN public.users u ON u.id = l.created_by
+         ${clause}
+        ORDER BY l.created_at DESC
+        LIMIT 500`,
+      params
+    );
+    return rows.map(rowToTransaction);
+  }
+
+  async summary() {
+    const inv = await db.query(
+      `SELECT
+         COUNT(*)::int AS total_products,
+         SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END)::int AS active_products,
+         SUM(CASE WHEN status = 'ACTIVE' AND stock <= reorder_pt THEN 1 ELSE 0 END)::int AS low_stock_items
+       FROM public.inventory`
+    );
+    const shipped = await db.query(
+      `SELECT COALESCE(SUM(ABS(qty_change)), 0)::int AS total
+         FROM public.inventory_logs
+        WHERE action = 'remove' AND pickup_date = $1`,
+      [todayISO()]
+    );
+    return {
+      totalProducts: inv.rows[0]?.total_products ?? 0,
+      activeProducts: inv.rows[0]?.active_products ?? 0,
+      lowStockItems: inv.rows[0]?.low_stock_items ?? 0,
+      shippedToday: shipped.rows[0]?.total ?? 0,
+    };
+  }
 }
 
 export default new InventoryService();

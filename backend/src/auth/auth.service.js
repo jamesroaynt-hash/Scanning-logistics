@@ -1,45 +1,54 @@
 /**
- * AuthService
- * -----------
- * Handles credential verification and JWT issuance.
+ * AuthService — verifies credentials against public.users and issues
+ * JWTs. Passwords stored as bcrypt ($2*) hashes are checked with
+ * bcrypt.compare; the legacy plaintext rows (e.g. the seed `staff`
+ * row in this DB) fall back to a string equality check.
  *
- * Bootstrap users come from config (env). Passwords are hashed at
- * startup so we never compare plaintext, even for the seed accounts.
+ * The `users.role` column uses display names ("Administrator",
+ * "Trainee", "CSR TL", ...). We collapse those into the two roles
+ * the rest of the app understands: 'admin' or 'staff'.
  */
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import db from '../services/db.service.js';
 import config from '../utils/config.js';
 import logger from '../utils/logger.js';
 
+function normaliseRole(raw) {
+  const s = String(raw || '').toLowerCase();
+  if (s.startsWith('admin')) return 'admin';
+  return 'staff';
+}
+
 class AuthService {
-  constructor() {
-    // Hash seed passwords once at boot.
-    this.users = config.users.map((u) => ({
-      username: u.username,
-      role: u.role,
-      passwordHash: bcrypt.hashSync(u.password, 10),
-    }));
-    logger.info(
-      `Auth initialised with ${this.users.length} user account(s).`
-    );
-  }
-
   async login(username, password) {
-    const user = this.users.find((u) => u.username === username);
-    if (!user) return null;
+    if (!username || !password) return null;
 
-    const ok = await bcrypt.compare(password, user.passwordHash);
+    const { rows } = await db.query(
+      'SELECT id, username, password, role FROM public.users WHERE username = $1 LIMIT 1',
+      [username]
+    );
+    const user = rows[0];
+    if (!user || !user.password) return null;
+
+    const stored = user.password;
+    const ok = typeof stored === 'string' && stored.startsWith('$2')
+      ? await bcrypt.compare(password, stored)
+      : password === stored;
+
     if (!ok) return null;
 
+    const role = normaliseRole(user.role);
     const token = jwt.sign(
-      { username: user.username, role: user.role },
+      { username: user.username, role },
       config.auth.jwtSecret,
       { expiresIn: config.auth.jwtExpiresIn }
     );
 
+    logger.info(`Login OK: ${user.username} (${role})`);
     return {
       token,
-      user: { username: user.username, role: user.role },
+      user: { username: user.username, role },
     };
   }
 

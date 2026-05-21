@@ -9,14 +9,16 @@ import { requireAuth } from '../middleware/auth.middleware.js';
 
 const router = Router();
 
-router.get('/sheets', requireAuth, (req, res) => {
-  res.json({ tabs: sheetConfig.getTabs() });
+router.get('/sheets', requireAuth, async (req, res, next) => {
+  try {
+    res.json({ tabs: await sheetConfig.getTabs() });
+  } catch (err) { next(err); }
 });
 
 router.put('/sheets', requireAuth, async (req, res, next) => {
   try {
     const { tabs } = req.body || {};
-    const saved = sheetConfig.setTabs(tabs);
+    const saved = await sheetConfig.setTabs(tabs);
     res.json({ success: true, tabs: saved });
   } catch (err) {
     err.status = err.status || 400;
