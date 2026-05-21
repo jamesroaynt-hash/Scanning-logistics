@@ -1,0 +1,91 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-ink-950 text-slate-100 font-sans antialiased;
+  margin: 0;
+}
+
+/* Light theme overrides */
+html:not(.dark) body {
+  @apply bg-slate-100 text-ink-900;
+}
+
+/* Custom scrollbar — industrial feel */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-ink-900;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-ink-600 rounded;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-accent;
+}
+
+/* Reusable component classes */
+@layer components {
+  .card {
+    @apply bg-ink-900/80 border border-ink-700 rounded-xl backdrop-blur;
+  }
+  html:not(.dark) .card {
+    @apply bg-white border-slate-200 shadow-sm;
+  }
+
+  .btn {
+    @apply px-4 py-2.5 rounded-lg font-display font-medium text-sm
+           transition-all duration-150 active:scale-[0.98]
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-ink-950 hover:bg-accent-soft
+           shadow-lg shadow-accent-glow;
+  }
+  .btn-ghost {
+    @apply btn bg-ink-700 text-slate-200 hover:bg-ink-600;
+  }
+  html:not(.dark) .btn-ghost {
+    @apply bg-slate-200 text-ink-800 hover:bg-slate-300;
+  }
+
+  .input {
+    @apply w-full bg-ink-800 border border-ink-600 rounded-lg px-4 py-3
+           text-slate-100 placeholder:text-slate-500
+           focus:outline-none focus:border-accent focus:ring-2
+           focus:ring-accent-glow transition;
+  }
+  html:not(.dark) .input {
+    @apply bg-white border-slate-300 text-ink-900;
+  }
+
+  .status-badge {
+    @apply inline-flex items-center gap-1.5 px-3 py-1 rounded-full
+           text-xs font-display font-semibold uppercase tracking-wide;
+  }
+}
+
+/* Scanner viewport framing */
+#qr-reader video {
+  border-radius: 0.75rem;
+  object-fit: cover;
+}
+#qr-reader__dashboard_section_csr button {
+  @apply btn-primary !important;
+}
+#qr-reader__scan_region img {
+  display: none;
+}

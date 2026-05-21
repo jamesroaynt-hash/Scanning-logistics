@@ -1,0 +1,9 @@
+ID,Day Created,Tracking Number,Customer,Phone Number,Status,Product Name,COD
+1,2026-05-12,TRK000001,Maria Santos,09171234567,Scanned,Wireless Earbuds,1499
+2,2026-05-12,TRK000002,Juan Dela Cruz,09281234567,Out for Delivery,Phone Case,299
+3,2026-05-13,TRK000003,Ana Reyes,09391234567,Delivered,Bluetooth Speaker,2199
+4,2026-05-13,TRK000004,Pedro Lim,09451234567,Pending,USB-C Cable,149
+5,2026-05-14,TRK000005,Grace Tan,09561234567,Returned,Smartwatch,3499
+6,2026-05-14,TRK000006,Carlos Yu,09671234567,Failed Delivery,Power Bank,899
+7,2026-05-15,TRK000007,Liza Cruz,09781234567,Pending,Laptop Stand,650
+8,2026-05-15,TRK000008,Mark Lee,09891234567,Delivered,Mechanical Keyboard,2750
